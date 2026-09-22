@@ -6,3 +6,4 @@ plotly
 numpy
 scikit-learn
 pandas
+yfinance
