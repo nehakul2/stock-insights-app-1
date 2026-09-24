@@ -351,6 +351,65 @@ def get_news(ticker: str, max_items: int = 5) -> list:
     return items
 
 
+@st.cache_data(ttl=86400, show_spinner=False)  # earnings dates rarely change intraday, cache for a day
+def get_next_earnings_date(ticker: str) -> str:
+    """Returns the next (or most recently announced) earnings report date as
+    'YYYY-MM-DD', or '' if unavailable. yfinance has returned this either as
+    a dict or a DataFrame across versions, so both shapes are handled."""
+    try:
+        cal = yf.Ticker(ticker).calendar
+    except Exception:
+        return ""
+
+    def _format(value):
+        if hasattr(value, "strftime"):
+            return value.strftime("%Y-%m-%d")
+        return str(value) if value else ""
+
+    try:
+        if isinstance(cal, dict):
+            dates = cal.get("Earnings Date")
+            if isinstance(dates, (list, tuple)) and dates:
+                return _format(dates[0])
+            if dates:
+                return _format(dates)
+        elif cal is not None and hasattr(cal, "empty") and not cal.empty and "Earnings Date" in cal.index:
+            val = cal.loc["Earnings Date"]
+            first = val.iloc[0] if hasattr(val, "iloc") else val
+            return _format(first)
+    except Exception:
+        pass
+    return ""
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_tickers(query: str, max_results: int = 8) -> list:
+    """Looks up a company name or partial symbol via Yahoo Finance's search
+    endpoint (yf.Search) and returns a list of {symbol, name, exchange, type}
+    dicts. Returns an empty list on any error or if the query is too short."""
+    query = (query or "").strip()
+    if len(query) < 2:
+        return []
+
+    try:
+        results = yf.Search(query, max_results=max_results).quotes
+    except Exception:
+        return []
+
+    matches = []
+    for item in results:
+        symbol = item.get("symbol")
+        if not symbol:
+            continue
+        matches.append({
+            "symbol": symbol,
+            "name": item.get("shortname") or item.get("longname") or symbol,
+            "exchange": item.get("exchange", ""),
+            "type": item.get("typeDisp") or item.get("quoteType", ""),
+        })
+    return matches
+
+
 # Common index symbols entered in non-Yahoo formats (Google Finance-style
 # leading dot, or bare names) get mapped to Yahoo Finance's caret notation.
 INDEX_ALIASES = {
@@ -362,6 +421,16 @@ INDEX_ALIASES = {
     "VIX": "^VIX", ".VIX": "^VIX",              # CBOE Volatility Index
     "FTSE": "^FTSE", ".FTSE": "^FTSE",          # FTSE 100
     "N225": "^N225", ".N225": "^N225",          # Nikkei 225
+
+    # Precious/industrial metals: Yahoo Finance uses continuous front-month
+    # futures notation (root symbol + "=F"), not an exchange's specific
+    # contract-month code (e.g. CME's "SIZ6" for Dec-2026 Silver). These
+    # aliases let common names or CME root symbols resolve to Yahoo's form.
+    "GOLD": "GC=F", "XAU": "GC=F", "GC": "GC=F",
+    "SILVER": "SI=F", "XAG": "SI=F", "SI": "SI=F",
+    "PLATINUM": "PL=F", "XPT": "PL=F", "PL": "PL=F",
+    "PALLADIUM": "PA=F", "XPD": "PA=F", "PA": "PA=F",
+    "COPPER": "HG=F", "HG": "HG=F",
 }
 
 
@@ -419,19 +488,22 @@ def build_sma_table(tickers: list, period: str) -> pd.DataFrame:
             except Exception:
                 exchange = ""
 
+            next_earnings = get_next_earnings_date(ticker)
+
             row = {
                 "ticker": ticker.upper(),
                 "exchange": exchange,
                 "date": hist_with_sma.index[-1].strftime("%Y-%m-%d"),
                 "close": round(float(latest["Close"]), 2),
                 "prev_close": round(float(hist_with_sma.iloc[-2]["Close"]), 2) if len(hist_with_sma) >= 2 else None,
+                "next_earnings": next_earnings,
             }
             for window in SMA_WINDOWS:
                 value = latest.get(f"SMA_{window}")
                 row[f"sma_{window}"] = round(float(value), 2) if pd.notna(value) else None
             rows.append(row)
         except Exception as e:
-            rows.append({"ticker": ticker.upper(), "exchange": "", "date": None, "close": None, "error": str(e)})
+            rows.append({"ticker": ticker.upper(), "exchange": "", "date": None, "close": None, "next_earnings": "", "error": str(e)})
 
     return pd.DataFrame(rows)
 
@@ -583,27 +655,49 @@ def make_comparison_chart(histories: dict, dark_mode: bool):
     return fig
 
 
-def make_interactive_ohlc_chart(ticker: str, hist: pd.DataFrame, dark_mode: bool):
-    """An interactive candlestick chart (Plotly) with a built-in hover tooltip
-    showing Date/Open/High/Low/Close at whatever point the cursor is over,
-    plus a range slider/selector for zooming into a sub-period."""
-    fig = go.Figure(
-        data=[
-            go.Candlestick(
-                x=hist.index,
-                open=hist["Open"],
-                high=hist["High"],
-                low=hist["Low"],
-                close=hist["Close"],
-                increasing_line_color="#4caf50",
-                decreasing_line_color="#f44336",
-                name=ticker.upper(),
-            )
-        ]
-    )
+CHART_TYPE_OPTIONS = ["Candlestick", "Line", "Area"]
+
+
+def make_interactive_ohlc_chart(ticker: str, hist: pd.DataFrame, dark_mode: bool, chart_type: str = "Candlestick"):
+    """An interactive price chart (Plotly) with a built-in hover tooltip and a
+    range slider/selector for zooming into a sub-period. `chart_type` picks
+    the visual form: a full OHLC candlestick, a simple closing-price line, or
+    a filled area under the closing price."""
+    if chart_type == "Candlestick":
+        trace = go.Candlestick(
+            x=hist.index,
+            open=hist["Open"],
+            high=hist["High"],
+            low=hist["Low"],
+            close=hist["Close"],
+            increasing_line_color="#4caf50",
+            decreasing_line_color="#f44336",
+            name=ticker.upper(),
+        )
+    elif chart_type == "Area":
+        trace = go.Scatter(
+            x=hist.index,
+            y=hist["Close"],
+            mode="lines",
+            fill="tozeroy",
+            line=dict(color="#2196f3", width=2),
+            name=ticker.upper(),
+            hovertemplate="Date: %{x|%Y-%m-%d}<br>Close: %{y:.2f}<extra></extra>",
+        )
+    else:  # Line
+        trace = go.Scatter(
+            x=hist.index,
+            y=hist["Close"],
+            mode="lines",
+            line=dict(color="#2196f3", width=2),
+            name=ticker.upper(),
+            hovertemplate="Date: %{x|%Y-%m-%d}<br>Close: %{y:.2f}<extra></extra>",
+        )
+
+    fig = go.Figure(data=[trace])
 
     fig.update_layout(
-        title=f"{ticker.upper()} — Interactive Price Chart",
+        title=f"{ticker.upper()} — Interactive Price Chart ({chart_type})",
         xaxis_title="Date",
         yaxis_title="Price",
         template="plotly_dark" if dark_mode else "plotly_white",
@@ -648,6 +742,24 @@ def render_stock_details(ticker: str, fetch_period: str, chart_days: int, select
             profile["tickers"].append(ticker)
             persist()
             st.rerun()
+
+    st.markdown("**Interactive chart — hover for details at any point**")
+    chart_type = st.radio(
+        "Chart type",
+        options=CHART_TYPE_OPTIONS,
+        horizontal=True,
+        key=f"chart_type_{ticker}",
+        label_visibility="collapsed",
+    )
+    st.plotly_chart(
+        make_interactive_ohlc_chart(ticker, hist_with_sma, dark_mode, chart_type),
+        use_container_width=True,
+        key=f"candlestick_{ticker}",
+    )
+    if chart_type == "Candlestick":
+        st.caption("Hover for Date/Open/High/Low/Close. Drag the range slider, or use the 1w/1m/3m/6m/1y/All buttons, to zoom.")
+    else:
+        st.caption("Hover for Date/Close. Drag the range slider, or use the 1w/1m/3m/6m/1y/All buttons, to zoom.")
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -715,10 +827,6 @@ def render_stock_details(ticker: str, fetch_period: str, chart_days: int, select
 
     st.markdown("**Moving averages (all 5, on their own scale)**")
     st.pyplot(make_sma_chart(ticker, hist_with_sma, chart_days, dark_mode))
-
-    st.markdown("**Interactive chart — hover for Date/Open/High/Low/Close at any point**")
-    st.plotly_chart(make_interactive_ohlc_chart(ticker, hist_with_sma, dark_mode), use_container_width=True, key=f"candlestick_{ticker}")
-    st.caption("Drag the range slider below the chart, or use the 1w/1m/3m/6m/1y/All buttons, to zoom into a period.")
 
     st.markdown("**Open, High, Low, Close for a date range**")
     full_min_date = hist_with_sma.index.min().date()
@@ -902,9 +1010,33 @@ with st.sidebar:
         st.caption("✓ Matches this profile's saved defaults.")
 
     st.divider()
+    active_profile = get_active_profile()
+
+    st.header("🔍 Search for a ticker")
+    st.caption("Not sure of the exact symbol? Search by company name instead.")
+    search_query = st.text_input("Company name or symbol", key="ticker_search_query", placeholder="e.g. apple, gold, tesla")
+    if search_query.strip():
+        search_results = search_tickers(search_query)
+        if search_results:
+            for r in search_results:
+                rcol1, rcol2 = st.columns([3, 1])
+                label = f"**{r['symbol']}** — {r['name']}"
+                extra = " / ".join(x for x in [r.get("exchange"), r.get("type")] if x)
+                if extra:
+                    label += f"  \n*{extra}*"
+                rcol1.markdown(label)
+                already_added = r["symbol"] in active_profile["tickers"]
+                if rcol2.button("✓ Added" if already_added else "Add", key=f"search_add_{r['symbol']}", disabled=already_added):
+                    active_profile["tickers"].append(r["symbol"])
+                    persist()
+                    st.toast(f"Added {r['symbol']} to watchlist", icon="✅")
+                    st.rerun()
+        else:
+            st.caption("No matches found — try a different spelling or the ticker symbol directly.")
+
+    st.divider()
     st.header(f"⭐ Watchlist — {st.session_state.active_profile}")
 
-    active_profile = get_active_profile()
     new_watch_ticker = st.text_input("Add ticker(s)", key="new_watch_ticker", placeholder="e.g. NVDA or NVDA, AMD")
     if st.button("Add to watchlist") and new_watch_ticker.strip():
         new_tickers = [normalize_ticker(t) for t in new_watch_ticker.split(",") if t.strip()]
@@ -1034,12 +1166,12 @@ else:
     sma_table = build_sma_table(combined_tickers, fetch_period)
 
     st.subheader("SMA Overview")
-    header_cols = st.columns([1.2, 1.3, 1, 1, 1, 1, 1, 1])
-    for col, label in zip(header_cols, ["Ticker", "Exchange", "Close", "SMA 5", "SMA 20", "SMA 50", "SMA 100", "SMA 200"]):
+    header_cols = st.columns([1.2, 1.3, 1, 1, 1, 1, 1, 1, 1.3])
+    for col, label in zip(header_cols, ["Ticker", "Exchange", "Close", "SMA 5", "SMA 20", "SMA 50", "SMA 100", "SMA 200", "Next Earnings"]):
         col.markdown(f"**{label}**")
 
     for _, row in sma_table.iterrows():
-        cols = st.columns([1.2, 1.3, 1, 1, 1, 1, 1, 1])
+        cols = st.columns([1.2, 1.3, 1, 1, 1, 1, 1, 1, 1.3])
         if cols[0].button(row["ticker"], key=f"select_{row['ticker']}"):
             st.session_state.selected_ticker = row["ticker"]
         cols[1].write(row.get("exchange") or "—")
@@ -1057,6 +1189,7 @@ else:
             for i, window in enumerate(SMA_WINDOWS, start=3):
                 value = row.get(f"sma_{window}")
                 cols[i].write(value if pd.notna(value) else "—")
+            cols[8].write(row.get("next_earnings") or "—")
 
     csv_buffer = io.StringIO()
     sma_table.to_csv(csv_buffer, index=False)
