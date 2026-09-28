@@ -320,6 +320,14 @@ def get_stock_summary(ticker: str) -> dict:
         "low_52wk": week_52_low,
         "currency": currency,
         "exchange": exchange,
+        # Extended-hours fields: only meaningful for US equities/ETFs while
+        # the market is in a pre-market or post-market state. yfinance omits
+        # these keys entirely outside those windows, so all reads use .get().
+        "market_state": info.get("marketState", ""),
+        "pre_market_price": info.get("preMarketPrice"),
+        "pre_market_change_pct": info.get("preMarketChangePercent"),
+        "post_market_price": info.get("postMarketPrice"),
+        "post_market_change_pct": info.get("postMarketChangePercent"),
     }
 
 
@@ -329,6 +337,28 @@ def fetch_history(ticker: str, period: str) -> pd.DataFrame:
     if hist.empty:
         raise ValueError(f"No price history found for {ticker}. Check the symbol.")
     return hist
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_intraday_extended(ticker: str) -> pd.DataFrame:
+    """1-minute intraday bars for the most recent trading day, including
+    pre-market and after-hours prints (prepost=True). Extended-hours data is
+    a US-market concept and 1-minute intraday isn't available for every
+    instrument (indexes, some futures), so this can legitimately come back
+    empty — callers should handle that rather than treat it as an error."""
+    try:
+        intraday = yf.Ticker(ticker).history(period="1d", interval="1m", prepost=True)
+        if intraday.empty:
+            # Market may be fully closed (weekend/holiday) with no "today" bars yet;
+            # fall back to the most recent available day within the last 5.
+            wider = yf.Ticker(ticker).history(period="5d", interval="1m", prepost=True)
+            if wider.empty:
+                return wider
+            last_day = wider.index.max().date()
+            intraday = wider[wider.index.date == last_day]
+        return intraday
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -722,6 +752,164 @@ def make_interactive_ohlc_chart(ticker: str, hist: pd.DataFrame, dark_mode: bool
     return fig
 
 
+def make_extended_hours_chart(ticker: str, intraday: pd.DataFrame, dark_mode: bool):
+    """1-minute price line for the most recent trading day, with shaded
+    pre-market and after-hours regions so extended-hours activity is visually
+    distinct from the 9:30am-4:00pm ET regular session. Assumes `intraday`
+    (from fetch_intraday_extended) has a tz-aware DatetimeIndex, which
+    yfinance returns in the exchange's local timezone for US tickers."""
+    idx = intraday.index
+    # Normalize to tz-naive "local exchange time" for the 9:30/16:00 comparison.
+    if idx.tz is not None:
+        try:
+            local_times = idx.tz_convert("America/New_York").tz_localize(None)
+        except Exception:
+            local_times = idx.tz_localize(None)
+    else:
+        local_times = idx
+
+    day = local_times.date.min()
+    market_open = pd.Timestamp.combine(day, datetime.strptime("09:30", "%H:%M").time())
+    market_close = pd.Timestamp.combine(day, datetime.strptime("16:00", "%H:%M").time())
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=idx,
+            y=intraday["Close"],
+            mode="lines",
+            line=dict(color="#2196f3", width=2),
+            name=ticker.upper(),
+            hovertemplate="Time: %{x|%H:%M}<br>Price: %{y:.2f}<extra></extra>",
+        )
+    )
+
+    day_start = idx.min()
+    day_end = idx.max()
+    shade_color = "rgba(255,193,7,0.12)" if dark_mode else "rgba(255,193,7,0.18)"
+
+    # Re-express the open/close boundary times in the index's own tz (or naive)
+    # so add_vrect's x-range lines up with the plotted x-axis.
+    tz = idx.tz
+    open_boundary = market_open.tz_localize(tz) if tz is not None else market_open
+    close_boundary = market_close.tz_localize(tz) if tz is not None else market_close
+
+    if day_start < open_boundary:
+        fig.add_vrect(x0=day_start, x1=open_boundary, fillcolor=shade_color, line_width=0)
+    if day_end > close_boundary:
+        fig.add_vrect(x0=close_boundary, x1=day_end, fillcolor=shade_color, line_width=0)
+
+    fig.update_layout(
+        title=f"{ticker.upper()} — Today (1-min, incl. pre/after-market)",
+        xaxis_title="Time",
+        yaxis_title="Price",
+        template="plotly_dark" if dark_mode else "plotly_white",
+        height=400,
+        margin=dict(l=40, r=20, t=50, b=40),
+        hovermode="x unified",
+    )
+    return fig
+
+
+def explain_price_move(ticker: str, hist_with_sma: pd.DataFrame, news_items: list) -> dict:
+    """Builds a heuristic 'why is this moving' explanation from data already
+    on hand: today's move size, whether volume looks unusual, how the move
+    compares to the S&P 500 over the same window, proximity to an earnings
+    report, and recent headlines. This is pattern-matching over public data,
+    not a verified causal explanation — headlines are surfaced as *possible*
+    context, never a confirmed cause."""
+    result = {
+        "pct_change": None,
+        "magnitude": "",
+        "volume_note": "",
+        "market_note": "",
+        "earnings_note": "",
+        "headlines": [],
+    }
+
+    if len(hist_with_sma) < 2:
+        return result
+
+    today_close = float(hist_with_sma.iloc[-1]["Close"])
+    prev_close = float(hist_with_sma.iloc[-2]["Close"])
+    pct_change = (today_close - prev_close) / prev_close * 100 if prev_close else None
+    result["pct_change"] = pct_change
+
+    if pct_change is not None:
+        abs_pct = abs(pct_change)
+        if abs_pct >= 5:
+            result["magnitude"] = "a large move"
+        elif abs_pct >= 2:
+            result["magnitude"] = "a notable move"
+        elif abs_pct >= 0.5:
+            result["magnitude"] = "a modest move"
+        else:
+            result["magnitude"] = "a small, unremarkable move"
+
+    # Volume vs. the trailing 20-day average (today excluded, so a spike isn't self-diluted).
+    if "Volume" in hist_with_sma.columns and len(hist_with_sma) >= 21:
+        today_volume = hist_with_sma.iloc[-1]["Volume"]
+        avg_volume = hist_with_sma["Volume"].iloc[-21:-1].mean()
+        if avg_volume and today_volume:
+            ratio = today_volume / avg_volume
+            if ratio >= 2:
+                result["volume_note"] = (
+                    f"Volume is running about {ratio:.1f}x the 20-day average — unusually heavy "
+                    "trading, often a sign something specific (news, a large trade, options "
+                    "activity) is driving today's move."
+                )
+            elif ratio >= 1.4:
+                result["volume_note"] = f"Volume is about {ratio:.1f}x the 20-day average — somewhat elevated."
+            elif ratio <= 0.6:
+                result["volume_note"] = (
+                    f"Volume is only about {ratio:.1f}x the 20-day average — a quiet day, so "
+                    "today's move may just be normal drift on light trading."
+                )
+
+    # Compare to the broader market (S&P 500) over the same window.
+    try:
+        benchmark = fetch_history("^GSPC", "1mo")
+        if len(benchmark) >= 2:
+            b_today = float(benchmark.iloc[-1]["Close"])
+            b_prev = float(benchmark.iloc[-2]["Close"])
+            b_pct = (b_today - b_prev) / b_prev * 100 if b_prev else None
+            if b_pct is not None and pct_change is not None:
+                diff = pct_change - b_pct
+                if abs(diff) <= 0.5:
+                    result["market_note"] = (
+                        f"The S&P 500 moved {b_pct:+.2f}% over the same period — {ticker.upper()} "
+                        "is moving roughly in line with the broader market, so this may be more "
+                        "market-wide than stock-specific."
+                    )
+                else:
+                    result["market_note"] = (
+                        f"The S&P 500 moved {b_pct:+.2f}% over the same period, notably different "
+                        f"from {ticker.upper()}'s {pct_change:+.2f}% — suggesting something "
+                        "stock-specific rather than a broad market move."
+                    )
+    except Exception:
+        pass
+
+    # Proximity to an earnings report.
+    earnings_date_str = get_next_earnings_date(ticker)
+    if earnings_date_str:
+        try:
+            earnings_date = datetime.strptime(earnings_date_str, "%Y-%m-%d").date()
+            days_diff = abs((earnings_date - datetime.now().date()).days)
+            if days_diff <= 2:
+                result["earnings_note"] = (
+                    f"This is close to its earnings report date ({earnings_date_str}) — earnings "
+                    "reactions are a common driver of outsized moves."
+                )
+        except Exception:
+            pass
+
+    # Headlines as possible (not confirmed) context.
+    result["headlines"] = news_items[:3]
+
+    return result
+
+
 def render_stock_details(ticker: str, fetch_period: str, chart_days: int, selected_smas: list, dark_mode: bool):
     try:
         summary = get_stock_summary(ticker)
@@ -777,6 +965,84 @@ def render_stock_details(ticker: str, fetch_period: str, chart_days: int, select
         )
     col2.metric("52-Week High", f"{summary['high_52wk']} {summary['currency']}")
     col3.metric("52-Week Low", f"{summary['low_52wk']} {summary['currency']}")
+
+    market_state = (summary.get("market_state") or "").upper()
+    pre_price = summary.get("pre_market_price")
+    pre_pct = summary.get("pre_market_change_pct")
+    post_price = summary.get("post_market_price")
+    post_pct = summary.get("post_market_change_pct")
+
+    badge = None
+    if market_state == "PRE" and pre_price is not None:
+        badge = ("Pre-market", pre_price, pre_pct)
+    elif market_state in ("POST", "POSTPOST", "CLOSED") and post_price is not None:
+        badge = ("After hours", post_price, post_pct)
+
+    if badge:
+        label, ext_price, ext_pct = badge
+        pct_text = f" ({ext_pct:+.2f}%)" if ext_pct is not None else ""
+        ext_bg, ext_border = price_change_colors(ext_price, summary["price"])
+        st.markdown(
+            f"""
+            <div style="background-color: {ext_bg}; border: 1px solid {ext_border};
+                        border-radius: 8px; padding: 8px 12px; margin-top: 8px; display: inline-block;">
+                <span style="font-size: 0.85rem; opacity: 0.85;">{label}:</span>
+                <span style="font-size: 1.1rem; font-weight: 700;"> {ext_price} {summary['currency']}{pct_text}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("**🔎 Why is this moving?**")
+    news_items = get_news(ticker)
+    explanation = explain_price_move(ticker, hist_with_sma, news_items)
+    if explanation["pct_change"] is None:
+        st.caption("Not enough price history yet to explain today's move.")
+    else:
+        pct = explanation["pct_change"]
+        if pct > 0:
+            arrow, direction_word = "🔺", "up"
+        elif pct < 0:
+            arrow, direction_word = "🔻", "down"
+        else:
+            arrow, direction_word = "➖", "flat"
+        st.markdown(f"{arrow} **{ticker.upper()} is {direction_word} {abs(pct):.2f}%** today — {explanation['magnitude']}.")
+
+        bullets = [n for n in (explanation["market_note"], explanation["volume_note"], explanation["earnings_note"]) if n]
+        for b in bullets:
+            st.markdown(f"- {b}")
+
+        if explanation["headlines"]:
+            st.caption("Possible context from recent headlines (not confirmed as the cause):")
+            for n in explanation["headlines"]:
+                if n["link"]:
+                    st.markdown(f"- [{n['title']}]({n['link']}) — *{n['publisher']}*")
+                else:
+                    st.markdown(f"- {n['title']} — *{n['publisher']}*")
+
+        if not bullets and not explanation["headlines"]:
+            st.caption("No unusual volume, earnings proximity, or notable headlines found — likely routine fluctuation.")
+
+        st.caption(
+            "⚠️ This is a heuristic explanation from volume, market comparison, earnings timing, "
+            "and headlines — not a verified cause. Not financial advice."
+        )
+
+    with st.expander("🌙 Pre-market / after-hours chart (today, 1-min)"):
+        st.caption(
+            "Extended-hours trading happens outside the regular 9:30am-4:00pm ET session "
+            "and tends to be lower-volume and more volatile. Not available for every "
+            "ticker (e.g. indexes and some futures don't trade extended hours)."
+        )
+        extended = fetch_intraday_extended(ticker)
+        if extended.empty:
+            st.info("No extended-hours intraday data available for this ticker right now.")
+        else:
+            st.plotly_chart(
+                make_extended_hours_chart(ticker, extended, dark_mode),
+                use_container_width=True,
+                key=f"extended_hours_{ticker}",
+            )
 
     if selected_smas:
         st.markdown("**SMA (Simple Moving Averages)**")
@@ -864,7 +1130,6 @@ def render_stock_details(ticker: str, fetch_period: str, chart_days: int, select
             )
 
     st.markdown("**Recent news**")
-    news_items = get_news(ticker)
     if news_items:
         for n in news_items:
             if n["link"]:
