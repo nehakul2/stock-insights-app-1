@@ -27,7 +27,7 @@ from sklearn.linear_model import LinearRegression
 from streamlit_autorefresh import st_autorefresh
 
 
-st.set_page_config(page_title="Stock Insights", layout="centered", page_icon="📈")
+st.set_page_config(page_title="Stock Insights", layout="centered", page_icon="📈", initial_sidebar_state="expanded")
 
 SMA_WINDOWS = [5, 20, 50, 100, 200]
 SMA_COLORS = {
@@ -300,17 +300,48 @@ def price_change_colors(current: float, previous_close: float) -> tuple:
 @st.cache_data(ttl=60, show_spinner=False)
 def get_stock_summary(ticker: str) -> dict:
     stock = yf.Ticker(ticker)
-    info = stock.info
+    # Yahoo sometimes returns an empty/partial `info` (rate limiting on shared
+    # cloud IPs is the usual cause), even for valid symbols like TGT. So every
+    # field below has a fallback instead of failing on the first miss.
+    try:
+        info = stock.info or {}
+    except Exception:
+        info = {}
 
     current_price = info.get("currentPrice") or info.get("regularMarketPrice")
     week_52_high = info.get("fiftyTwoWeekHigh")
     week_52_low = info.get("fiftyTwoWeekLow")
-    long_name = info.get("longName", ticker)
+    long_name = info.get("longName") or info.get("shortName") or ticker
     currency = info.get("currency", "")
     exchange = info.get("fullExchangeName") or info.get("exchange", "")
 
     if current_price is None:
-        raise ValueError(f"Couldn't find data for ticker '{ticker}'. Check the symbol.")
+        try:
+            fast = stock.fast_info
+            current_price = fast.get("last_price")
+            week_52_high = week_52_high or fast.get("year_high")
+            week_52_low = week_52_low or fast.get("year_low")
+            currency = currency or fast.get("currency", "")
+            exchange = exchange or fast.get("exchange", "")
+        except Exception:
+            pass
+
+    if current_price is None:
+        # Last resort: derive from a year of daily bars.
+        try:
+            h = stock.history(period="1y")
+            if not h.empty:
+                current_price = float(h["Close"].iloc[-1])
+                week_52_high = week_52_high or float(h["High"].max())
+                week_52_low = week_52_low or float(h["Low"].min())
+        except Exception:
+            pass
+
+    if current_price is None:
+        raise ValueError(
+            f"Couldn't load data for '{ticker}' right now. The symbol may be wrong, or Yahoo Finance "
+            "may be temporarily throttling requests - wait a minute and click 'Refresh now'."
+        )
 
     return {
         "name": long_name,
@@ -910,6 +941,47 @@ def explain_price_move(ticker: str, hist_with_sma: pd.DataFrame, news_items: lis
     return result
 
 
+def generate_ai_move_summary(api_key: str, ticker: str, explanation: dict) -> str:
+    """Turns the already-computed heuristic facts (price move, volume note,
+    market comparison, earnings proximity, headlines) into a short
+    plain-English narrative via the Claude API. This is a small proof-of-
+    concept for whether LLM-written analysis is worth building out further —
+    it only synthesizes facts already gathered above, it doesn't research
+    anything new. Raises on any API error so the caller can show a friendly
+    message; imports `anthropic` lazily so the app still runs without the
+    package installed if this feature is never used."""
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    pct = explanation["pct_change"]
+    facts = [f"{ticker.upper()} is {'up' if pct >= 0 else 'down'} {abs(pct):.2f}% today ({explanation['magnitude']})."]
+    if explanation["market_note"]:
+        facts.append(explanation["market_note"])
+    if explanation["volume_note"]:
+        facts.append(explanation["volume_note"])
+    if explanation["earnings_note"]:
+        facts.append(explanation["earnings_note"])
+    for n in explanation["headlines"]:
+        facts.append(f'Headline: "{n["title"]}" ({n["publisher"]})')
+
+    prompt = (
+        "You are a plain-English markets explainer for a casual retail investor, not a "
+        "financial advisor. Given ONLY the facts below about one stock's move today, write "
+        "a 2-4 sentence explanation of what's likely going on. Be upfront about uncertainty "
+        "— these facts are correlational, not proof of causation. Do not invent facts beyond "
+        "what's listed. Do not give buy/sell advice.\n\n"
+        f"Facts about {ticker.upper()}:\n- " + "\n- ".join(facts)
+    )
+
+    message = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=300,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return message.content[0].text.strip()
+
+
 def render_stock_details(ticker: str, fetch_period: str, chart_days: int, selected_smas: list, dark_mode: bool):
     try:
         summary = get_stock_summary(ticker)
@@ -957,8 +1029,8 @@ def render_stock_details(ticker: str, fetch_period: str, chart_days: int, select
             f"""
             <div style="background-color: {bg_color}; border: 1px solid {border_color};
                         border-radius: 8px; padding: 10px 12px;">
-                <div style="font-size: 0.8rem; opacity: 0.8;">Current Price</div>
-                <div style="font-size: 1.6rem; font-weight: 700;">{summary['price']} {summary['currency']}</div>
+                <div style="font-size: 1rem; opacity: 0.8;">Current Price</div>
+                <div style="font-size: 2.4rem; font-weight: 700;">{summary['price']} {summary['currency']}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -986,8 +1058,8 @@ def render_stock_details(ticker: str, fetch_period: str, chart_days: int, select
             f"""
             <div style="background-color: {ext_bg}; border: 1px solid {ext_border};
                         border-radius: 8px; padding: 8px 12px; margin-top: 8px; display: inline-block;">
-                <span style="font-size: 0.85rem; opacity: 0.85;">{label}:</span>
-                <span style="font-size: 1.1rem; font-weight: 700;"> {ext_price} {summary['currency']}{pct_text}</span>
+                <span style="font-size: 1.05rem; opacity: 0.85;">{label}:</span>
+                <span style="font-size: 1.6rem; font-weight: 700;"> {ext_price} {summary['currency']}{pct_text}</span>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1028,6 +1100,23 @@ def render_stock_details(ticker: str, fetch_period: str, chart_days: int, select
             "and headlines — not a verified cause. Not financial advice."
         )
 
+        ai_key = st.session_state.get("anthropic_api_key", "").strip()
+        ai_cache_key = f"ai_move_summary_{ticker}_{round(pct, 2)}"
+        if ai_key:
+            if st.button("✨ Get AI-written summary", key=f"ai_summary_btn_{ticker}"):
+                with st.spinner("Asking Claude..."):
+                    try:
+                        st.session_state[ai_cache_key] = generate_ai_move_summary(ai_key, ticker, explanation)
+                    except Exception as e:
+                        st.error(f"Couldn't generate an AI summary: {e}")
+            if ai_cache_key in st.session_state:
+                st.info(st.session_state[ai_cache_key])
+        else:
+            st.caption(
+                "💡 Add an Anthropic API key in the sidebar (under '🤖 AI analysis') to get a "
+                "richer, AI-written version of this explanation."
+            )
+
     with st.expander("🌙 Pre-market / after-hours chart (today, 1-min)"):
         st.caption(
             "Extended-hours trading happens outside the regular 9:30am-4:00pm ET session "
@@ -1056,8 +1145,8 @@ def render_stock_details(ticker: str, fetch_period: str, chart_days: int, select
                     f"""
                     <div style="background-color: rgba(33, 150, 243, 0.15); border: 1px solid rgba(33, 150, 243, 0.6);
                                 border-radius: 8px; padding: 8px 10px; text-align: center;">
-                        <div style="font-size: 0.75rem; opacity: 0.8;">SMA {window}</div>
-                        <div style="font-size: 1.2rem; font-weight: 700;">{display_value}</div>
+                        <div style="font-size: 0.95rem; opacity: 0.8;">SMA {window}</div>
+                        <div style="font-size: 1.8rem; font-weight: 700;">{display_value}</div>
                     </div>
                     """,
                     unsafe_allow_html=True,
@@ -1275,6 +1364,21 @@ with st.sidebar:
         st.caption("✓ Matches this profile's saved defaults.")
 
     st.divider()
+    st.header("🤖 AI analysis (optional)")
+    st.caption(
+        "Adds an AI-written summary to each stock's 'Why is this moving?' section, using "
+        "Claude to turn the same underlying facts into a plain-English narrative. Nothing "
+        "is called unless you click the 'Get AI-written summary' button, and each click "
+        "costs a small amount against your own API usage."
+    )
+    st.text_input(
+        "Anthropic API key",
+        key="anthropic_api_key",
+        type="password",
+        help="Not saved anywhere — kept only for this browser session. Get a key at console.anthropic.com.",
+    )
+
+    st.divider()
     active_profile = get_active_profile()
 
     st.header("🔍 Search for a ticker")
@@ -1345,6 +1449,10 @@ st.markdown(
         border-radius: 8px;
         padding: 10px 12px;
     }
+    /* Larger numbers: st.metric values/labels and table cells */
+    div[data-testid="stMetricValue"] { font-size: 2rem !important; }
+    div[data-testid="stMetricLabel"] { font-size: 1rem !important; }
+    div[data-testid="stDataFrame"] { font-size: 1.05rem; }
     div[data-testid="column"] button[kind="secondary"] {
         background: none;
         border: none;
@@ -1352,6 +1460,16 @@ st.markdown(
         text-decoration: underline;
         padding: 0;
         font-weight: 600;
+    }
+    /* Streamlit hides the sidebar's collapse arrow until you hover over it,
+       which makes the sidebar look un-collapsible. Keep it always visible,
+       along with the "expand" arrow shown once the sidebar is collapsed. */
+    button[data-testid="stSidebarCollapseButton"],
+    [data-testid="stSidebarCollapseButton"] button,
+    [data-testid="stExpandSidebarButton"],
+    [data-testid="collapsedControl"] {
+        opacity: 1 !important;
+        visibility: visible !important;
     }
     </style>
     """,
