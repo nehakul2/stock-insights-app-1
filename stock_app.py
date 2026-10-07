@@ -27,7 +27,7 @@ from sklearn.linear_model import LinearRegression
 from streamlit_autorefresh import st_autorefresh
 
 
-st.set_page_config(page_title="Stock Insights", layout="centered", page_icon="📈", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Stock Insights", layout="wide", page_icon="📈", initial_sidebar_state="expanded")
 
 SMA_WINDOWS = [5, 20, 50, 100, 200]
 SMA_COLORS = {
@@ -1454,7 +1454,7 @@ st.markdown(
     div[data-testid="stMetricLabel"] { font-size: 1rem !important; }
     div[data-testid="stDataFrame"] { font-size: 1.05rem; }
     /* SMA Overview: larger ticker buttons */
-    [class*="st-key-select_"] button p { font-size: 1.3rem !important; }
+    [class*="st-key-select_"] button p { font-size: 1.3rem !important; white-space: nowrap !important; }
     div[data-testid="column"] button[kind="secondary"] {
         background: none;
         border: none;
@@ -1554,14 +1554,14 @@ else:
 
     def big(text, style=""):
         # Larger text for the overview table cells.
-        return f"<span style='font-size:1.3rem; {style}'>{text}</span>"
+        return f"<span style='font-size:1.3rem; white-space:nowrap; {style}'>{text}</span>"
 
-    header_cols = st.columns([1.2, 1.3, 1, 1, 1, 1, 1, 1, 1.3])
+    header_cols = st.columns([1.3, 1.6, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.6])
     for col, label in zip(header_cols, ["Ticker", "Exchange", "Close", "SMA 5", "SMA 20", "SMA 50", "SMA 100", "SMA 200", "Next Earnings"]):
         col.markdown(big(f"<b>{label}</b>", "font-size:1.1rem;"), unsafe_allow_html=True)
 
     for _, row in sma_table.iterrows():
-        cols = st.columns([1.2, 1.3, 1, 1, 1, 1, 1, 1, 1.3])
+        cols = st.columns([1.3, 1.6, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.6])
         if cols[0].button(row["ticker"], key=f"select_{row['ticker']}"):
             st.session_state.selected_ticker = row["ticker"]
         cols[1].markdown(big(row.get("exchange") or "—"), unsafe_allow_html=True)
