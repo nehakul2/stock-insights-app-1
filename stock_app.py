@@ -1029,8 +1029,8 @@ def render_stock_details(ticker: str, fetch_period: str, chart_days: int, select
             f"""
             <div style="background-color: {bg_color}; border: 1px solid {border_color};
                         border-radius: 8px; padding: 10px 12px;">
-                <div style="font-size: 1rem; opacity: 0.8;">Current Price</div>
-                <div style="font-size: 2.4rem; font-weight: 700;">{summary['price']} {summary['currency']}</div>
+                <div style="font-size: 0.8rem; opacity: 0.8;">Current Price</div>
+                <div style="font-size: 1.6rem; font-weight: 700;">{summary['price']:.2f} {summary['currency']}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1058,8 +1058,8 @@ def render_stock_details(ticker: str, fetch_period: str, chart_days: int, select
             f"""
             <div style="background-color: {ext_bg}; border: 1px solid {ext_border};
                         border-radius: 8px; padding: 8px 12px; margin-top: 8px; display: inline-block;">
-                <span style="font-size: 1.05rem; opacity: 0.85;">{label}:</span>
-                <span style="font-size: 1.6rem; font-weight: 700;"> {ext_price} {summary['currency']}{pct_text}</span>
+                <span style="font-size: 0.85rem; opacity: 0.85;">{label}:</span>
+                <span style="font-size: 1.1rem; font-weight: 700;"> {ext_price:.2f} {summary['currency']}{pct_text}</span>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1453,6 +1453,8 @@ st.markdown(
     div[data-testid="stMetricValue"] { font-size: 2rem !important; }
     div[data-testid="stMetricLabel"] { font-size: 1rem !important; }
     div[data-testid="stDataFrame"] { font-size: 1.05rem; }
+    /* SMA Overview: larger ticker buttons */
+    [class*="st-key-select_"] button p { font-size: 1.3rem !important; }
     div[data-testid="column"] button[kind="secondary"] {
         background: none;
         border: none;
@@ -1549,18 +1551,23 @@ else:
     sma_table = build_sma_table(combined_tickers, fetch_period)
 
     st.subheader("SMA Overview")
+
+    def big(text, style=""):
+        # Larger text for the overview table cells.
+        return f"<span style='font-size:1.3rem; {style}'>{text}</span>"
+
     header_cols = st.columns([1.2, 1.3, 1, 1, 1, 1, 1, 1, 1.3])
     for col, label in zip(header_cols, ["Ticker", "Exchange", "Close", "SMA 5", "SMA 20", "SMA 50", "SMA 100", "SMA 200", "Next Earnings"]):
-        col.markdown(f"**{label}**")
+        col.markdown(big(f"<b>{label}</b>", "font-size:1.1rem;"), unsafe_allow_html=True)
 
     for _, row in sma_table.iterrows():
         cols = st.columns([1.2, 1.3, 1, 1, 1, 1, 1, 1, 1.3])
         if cols[0].button(row["ticker"], key=f"select_{row['ticker']}"):
             st.session_state.selected_ticker = row["ticker"]
-        cols[1].write(row.get("exchange") or "—")
+        cols[1].markdown(big(row.get("exchange") or "—"), unsafe_allow_html=True)
 
         if "error" in row and pd.notna(row.get("error")):
-            cols[2].markdown("⚠️ error")
+            cols[2].markdown(big("⚠️ error"), unsafe_allow_html=True)
         else:
             close_val = row["close"]
             prev_close_val = row.get("prev_close")
@@ -1568,11 +1575,11 @@ else:
                 text_color = "#2e7d32" if close_val > prev_close_val else "#c62828" if close_val < prev_close_val else "inherit"
             else:
                 text_color = "inherit"
-            cols[2].markdown(f"<span style='color:{text_color}; font-weight:700;'>{close_val}</span>", unsafe_allow_html=True)
+            cols[2].markdown(big(close_val, f'color:{text_color}; font-weight:700;'), unsafe_allow_html=True)
             for i, window in enumerate(SMA_WINDOWS, start=3):
                 value = row.get(f"sma_{window}")
-                cols[i].write(value if pd.notna(value) else "—")
-            cols[8].write(row.get("next_earnings") or "—")
+                cols[i].markdown(big(value if pd.notna(value) else "—"), unsafe_allow_html=True)
+            cols[8].markdown(big(row.get("next_earnings") or "—"), unsafe_allow_html=True)
 
     csv_buffer = io.StringIO()
     sma_table.to_csv(csv_buffer, index=False)
