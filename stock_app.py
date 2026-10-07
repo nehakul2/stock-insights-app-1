@@ -1453,6 +1453,23 @@ st.markdown(
     div[data-testid="stMetricValue"] { font-size: 2rem !important; }
     div[data-testid="stMetricLabel"] { font-size: 1rem !important; }
     div[data-testid="stDataFrame"] { font-size: 1.05rem; }
+    /* SMA Overview grid lines */
+    .st-key-sma_overview { border: 1px solid rgba(127,127,127,0.45); border-radius: 6px; overflow-x: auto; }
+    .st-key-sma_overview [data-testid="stHorizontalBlock"] {
+        gap: 0 !important;
+        border-bottom: 1px solid rgba(127,127,127,0.35);
+    }
+    .st-key-sma_overview [data-testid="stHorizontalBlock"]:last-child { border-bottom: none; }
+    .st-key-sma_overview [data-testid="stColumn"],
+    .st-key-sma_overview [data-testid="column"] {
+        border-right: 1px solid rgba(127,127,127,0.35);
+        padding: 6px 10px !important;
+    }
+    .st-key-sma_overview [data-testid="stColumn"]:last-child,
+    .st-key-sma_overview [data-testid="column"]:last-child { border-right: none; }
+    .st-key-sma_overview [data-testid="stHorizontalBlock"]:first-child {
+        background-color: rgba(127,127,127,0.12);
+    }
     /* SMA Overview: larger ticker buttons */
     [class*="st-key-select_"] button p { font-size: 1.3rem !important; white-space: nowrap !important; }
     div[data-testid="column"] button[kind="secondary"] {
@@ -1551,35 +1568,36 @@ else:
     sma_table = build_sma_table(combined_tickers, fetch_period)
 
     st.subheader("SMA Overview")
+    with st.container(key="sma_overview"):
 
-    def big(text, style=""):
-        # Larger text for the overview table cells.
-        return f"<span style='font-size:1.3rem; white-space:nowrap; {style}'>{text}</span>"
+        def big(text, style=""):
+            # Larger text for the overview table cells.
+            return f"<span style='font-size:1.3rem; white-space:nowrap; {style}'>{text}</span>"
 
-    header_cols = st.columns([1.3, 1.6, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.6])
-    for col, label in zip(header_cols, ["Ticker", "Exchange", "Close", "SMA 5", "SMA 20", "SMA 50", "SMA 100", "SMA 200", "Next Earnings"]):
-        col.markdown(big(f"<b>{label}</b>", "font-size:1.1rem;"), unsafe_allow_html=True)
+        header_cols = st.columns([1.3, 1.6, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.6])
+        for col, label in zip(header_cols, ["Ticker", "Exchange", "Close", "SMA 5", "SMA 20", "SMA 50", "SMA 100", "SMA 200", "Next Earnings"]):
+            col.markdown(big(f"<b>{label}</b>", "font-size:1.1rem;"), unsafe_allow_html=True)
 
-    for _, row in sma_table.iterrows():
-        cols = st.columns([1.3, 1.6, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.6])
-        if cols[0].button(row["ticker"], key=f"select_{row['ticker']}"):
-            st.session_state.selected_ticker = row["ticker"]
-        cols[1].markdown(big(row.get("exchange") or "—"), unsafe_allow_html=True)
+        for _, row in sma_table.iterrows():
+            cols = st.columns([1.3, 1.6, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.6])
+            if cols[0].button(row["ticker"], key=f"select_{row['ticker']}"):
+                st.session_state.selected_ticker = row["ticker"]
+            cols[1].markdown(big(row.get("exchange") or "—"), unsafe_allow_html=True)
 
-        if "error" in row and pd.notna(row.get("error")):
-            cols[2].markdown(big("⚠️ error"), unsafe_allow_html=True)
-        else:
-            close_val = row["close"]
-            prev_close_val = row.get("prev_close")
-            if prev_close_val is not None:
-                text_color = "#2e7d32" if close_val > prev_close_val else "#c62828" if close_val < prev_close_val else "inherit"
+            if "error" in row and pd.notna(row.get("error")):
+                cols[2].markdown(big("⚠️ error"), unsafe_allow_html=True)
             else:
-                text_color = "inherit"
-            cols[2].markdown(big(close_val, f'color:{text_color}; font-weight:700;'), unsafe_allow_html=True)
-            for i, window in enumerate(SMA_WINDOWS, start=3):
-                value = row.get(f"sma_{window}")
-                cols[i].markdown(big(value if pd.notna(value) else "—"), unsafe_allow_html=True)
-            cols[8].markdown(big(row.get("next_earnings") or "—"), unsafe_allow_html=True)
+                close_val = row["close"]
+                prev_close_val = row.get("prev_close")
+                if prev_close_val is not None:
+                    text_color = "#2e7d32" if close_val > prev_close_val else "#c62828" if close_val < prev_close_val else "inherit"
+                else:
+                    text_color = "inherit"
+                cols[2].markdown(big(close_val, f'color:{text_color}; font-weight:700;'), unsafe_allow_html=True)
+                for i, window in enumerate(SMA_WINDOWS, start=3):
+                    value = row.get(f"sma_{window}")
+                    cols[i].markdown(big(value if pd.notna(value) else "—"), unsafe_allow_html=True)
+                cols[8].markdown(big(row.get("next_earnings") or "—"), unsafe_allow_html=True)
 
     csv_buffer = io.StringIO()
     sma_table.to_csv(csv_buffer, index=False)
