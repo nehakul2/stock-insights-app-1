@@ -569,6 +569,94 @@ def build_sma_table(tickers: list, period: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# ---------- "Needs attention" pointers ----------
+
+def compute_attention(ticker: str) -> dict:
+    """Scans one ticker for things worth a closer look and returns
+    {"ticker", "score", "reasons"}. Each reason is phrased as a pointer
+    (what was noticed + what to check), not a verdict. Rule-based on price,
+    volume, SMAs, RSI, 52-week range, and earnings timing - no API calls
+    beyond the cached Yahoo data the rest of the app already uses."""
+    out = {"ticker": ticker, "score": 0.0, "reasons": []}
+    try:
+        hist = add_smas(fetch_history(ticker, ALERT_FETCH_PERIOD))
+    except Exception:
+        return out
+    if len(hist) < 22:
+        return out
+
+    close = hist["Close"]
+    last, prev = float(close.iloc[-1]), float(close.iloc[-2])
+    reasons = out["reasons"]
+
+    def add(weight, text):
+        out["score"] += weight
+        reasons.append(text)
+
+    # 1. Big daily move
+    pct = (last - prev) / prev * 100 if prev else 0
+    if abs(pct) >= 3:
+        word = "up" if pct > 0 else "down"
+        add(2 + abs(pct) / 5, f"Moved {word} {abs(pct):.1f}% in the last session - open the ticker to see what's driving it.")
+
+    # 2. Unusual volume (vs trailing 20-day average, excluding the latest day)
+    if "Volume" in hist.columns:
+        avg_vol = hist["Volume"].iloc[-21:-1].mean()
+        last_vol = hist["Volume"].iloc[-1]
+        if avg_vol and last_vol and last_vol / avg_vol >= 2:
+            add(1.5, f"Volume is {last_vol / avg_vol:.1f}x its 20-day average - heavy trading often means news or a big holder moving.")
+
+    # 3. Price crossing a key moving average on the latest bar
+    for window in (50, 200):
+        col = f"SMA_{window}"
+        if pd.notna(hist[col].iloc[-1]) and pd.notna(hist[col].iloc[-2]):
+            was_above = prev > hist[col].iloc[-2]
+            is_above = last > hist[col].iloc[-1]
+            if is_above and not was_above:
+                add(1.5, f"Crossed above its {window}-day average - check whether volume confirms the move.")
+            elif was_above and not is_above:
+                add(1.5, f"Dropped below its {window}-day average - a level many traders watch for support.")
+
+    # 4. 50/200 golden or death cross in the last 5 sessions
+    if hist["SMA_200"].notna().sum() >= 6:
+        diff = (hist["SMA_50"] - hist["SMA_200"]).iloc[-6:]
+        if (diff.iloc[0] < 0) and (diff.iloc[-1] > 0):
+            add(2, "50-day average crossed above the 200-day in the last week (a 'golden cross') - a long-term trend signal worth reading about.")
+        elif (diff.iloc[0] > 0) and (diff.iloc[-1] < 0):
+            add(2, "50-day average crossed below the 200-day in the last week (a 'death cross') - a long-term trend signal worth reading about.")
+
+    # 5. Near 52-week high / low
+    year = hist.tail(252)
+    hi, lo = float(year["High"].max()), float(year["Low"].min())
+    if hi and last >= hi * 0.98:
+        add(1.5, "Within 2% of its 52-week high - ask whether the run-up is backed by earnings or just momentum.")
+    elif lo and last <= lo * 1.02:
+        add(1.5, "Within 2% of its 52-week low - check for company-specific bad news versus a broad selloff.")
+
+    # 6. RSI(14) overbought / oversold
+    delta = close.diff().iloc[-15:]
+    gains, losses = delta.clip(lower=0).mean(), (-delta.clip(upper=0)).mean()
+    if losses and losses > 0:
+        rsi = 100 - 100 / (1 + gains / losses)
+        if rsi >= 70:
+            add(1, f"RSI is {rsi:.0f} (overbought territory) - after a strong run, moves can cool off.")
+        elif rsi <= 30:
+            add(1, f"RSI is {rsi:.0f} (oversold territory) - a heavy selloff; check why before assuming a bounce.")
+
+    # 7. Earnings close by
+    earn = get_next_earnings_date(ticker)
+    if earn:
+        try:
+            days = (datetime.strptime(earn, "%Y-%m-%d").date() - datetime.now().date()).days
+            if -1 <= days <= 3:
+                when = "today" if days == 0 else ("tomorrow" if days == 1 else (f"in {days} days" if days > 1 else "yesterday"))
+                add(2, f"Earnings report {when} ({earn}) - results often cause outsized moves; review expectations.")
+        except Exception:
+            pass
+
+    return out
+
+
 # ---------- Alerts ----------
 
 def check_ticker_alerts(ticker: str, alerts: list) -> list:
@@ -1566,6 +1654,22 @@ if not combined_tickers:
     st.info("Add tickers to this profile's watchlist (sidebar) or the box above to get started.")
 else:
     sma_table = build_sma_table(combined_tickers, fetch_period)
+
+    attention = [a for a in (compute_attention(t) for t in combined_tickers) if a["score"] > 0]
+    attention.sort(key=lambda a: a["score"], reverse=True)
+    with st.expander(f"🎯 Needs attention ({len(attention)} of {len(combined_tickers)} tickers)", expanded=bool(attention)):
+        if not attention:
+            st.caption("Nothing unusual right now - no big moves, volume spikes, key-level crosses, or imminent earnings.")
+        for a in attention[:8]:
+            c1, c2 = st.columns([1, 6])
+            if c1.button(a["ticker"], key=f"attn_{a['ticker']}"):
+                st.session_state.selected_ticker = a["ticker"]
+            with c2:
+                for r in a["reasons"]:
+                    st.markdown(f"- {r}")
+        if len(attention) > 8:
+            st.caption(f"+ {len(attention) - 8} more lower-priority tickers not shown.")
+        st.caption("Pointers are rule-based observations about what changed, not predictions or advice. Click a ticker to dig in.")
 
     st.subheader("SMA Overview")
     with st.container(key="sma_overview"):
